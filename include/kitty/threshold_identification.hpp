@@ -33,8 +33,11 @@
 #pragma once
 
 #include <vector>
-// #include <lpsolve/lp_lib.h> /* uncomment this line to include lp_solve */
+#include <lpsolve/lp_lib.h> /* uncomment this line to include lp_solve */
 #include "traits.hpp"
+
+#include <iostream>
+using namespace std;
 
 namespace kitty
 {
@@ -60,10 +63,214 @@ bool is_threshold( const TT& tt, std::vector<int64_t>* plf = nullptr )
 {
   std::vector<int64_t> linear_form;
 
-  /* TODO */
   /* if tt is non-TF: */
-  return false;
+  const int MAX_NUM = 100; // number of variables <= 32 due to int32_t
 
+  int NumBits = tt.num_bits();
+  int NumVars = tt.num_vars();
+  TT tt_flip = tt;
+  int flip_table[MAX_NUM];
+
+  if ( NumVars > MAX_NUM )
+  {
+    std::cout << "Number of variables are exceeded" << endl;
+    return false;
+  }
+
+  // check the unateness of the truth table
+  for ( auto i = 0u; i < NumVars; ++i )
+  {
+    if ( implies( cofactor1( tt, i ), cofactor0( tt, i ) ) ) // negative unate
+    {
+      tt_flip = flip( tt_flip, i ); // substitute the variable with its bar
+      flip_table[i] = 1;
+    }
+    else if ( implies( cofactor0( tt, i ), cofactor1( tt, i ) ) ) // positive unate
+    {
+      flip_table[i] = 0;
+    }
+    else // binate means non-TF
+    {
+      return false; // non-TF
+    }
+  }
+
+  /* "Formulation of an lp model in lpsolve" in http://lpsolve.sourceforge.net/ */
+  lprec* lp;
+  int Ncol, *colno = NULL, ret = 0;
+  REAL* row = NULL;
+  char var_name[10];
+
+  /* build the model row by row
+   * create a model with 0 rows and (NumVars + 1) columns */
+  Ncol = NumVars + 1; // [w_1, w_2, ..., w_n; T]
+  lp = make_lp( 0, Ncol );
+
+  if ( lp == NULL )
+  {
+    ret = 1; // couldn't construct a new model...
+  }
+
+  // create the variables
+  if ( ret == 0 )
+  {
+    // name the variables as [w_1, w_2, ..., w_n; T]
+    for ( auto i = 0u; i < NumVars; ++i )
+    {
+      sprintf( var_name, "w_%d", i );
+      set_col_name( lp, i + 1, var_name );
+    }
+    set_col_name( lp, Ncol, "T" );
+
+    // create space large enough for one row
+    colno = (int*)malloc( Ncol * sizeof( *colno ) );
+    row = (REAL*)malloc( Ncol * sizeof( *row ) );
+    if ( ( colno == NULL ) || ( row == NULL ) )
+    {
+      ret = 2;
+    }
+  }
+
+  // add the constraints
+  if ( ret == 0 )
+  {
+    set_add_rowmode( lp, TRUE ); // makes building the model faster if it is done row by row
+
+    // all of the variables are positive
+    for ( auto i = 0u; i < Ncol; ++i )
+    {
+      colno[0] = i + 1;
+      row[i] = 1;
+      if ( !add_constraintex( lp, 1, row, colno, GE, 0 ) )
+      {
+        ret = 3;
+      }
+    }
+ 
+    for ( auto i = 0u; i < NumBits; ++i )
+    {
+      int temp = i;
+      for ( auto j = 0u; j < NumVars; ++j )
+      {
+        colno[j] = j + 1;
+        row[j] = temp % 2;
+        temp = temp >> 1;
+      }
+
+      colno[NumVars] = Ncol;
+      row[NumVars] = -1; // -T
+      if ( get_bit( tt_flip, i ) )
+      {
+        add_constraintex( lp, Ncol, row, colno, GE, 0 ); // \sum_{i=1}^n w_i - T >= 0, xi is onset
+      }
+      else
+      {
+        add_constraintex( lp, Ncol, row, colno, LE, -1 ); // \sum_{i=1}^n w_i - T <= -1, xi is offset
+      }
+    }
+  }
+
+  // set the objective function \sum_{i=1}^n w_i + T
+  if ( ret == 0 )
+  {
+    set_add_rowmode( lp, FALSE ); // rowmode should be turned off again when done building the model
+
+    for ( auto i = 0u; i < Ncol; ++i )
+    {
+      colno[i] = i + 1;
+      row[i] = 1;
+    }
+    // set the objective in lpsolve
+    if ( !set_obj_fnex( lp, Ncol, row, colno ) )
+    {
+      ret = 6;
+    }
+  }
+
+  // set variables to int
+  if ( ret == 0 )
+  {
+    for ( int i = 1; i <= Ncol; i++ )
+      set_int( lp, i, TRUE );
+  }
+
+  // start to solve this LP problem
+  if ( ret == 0 )
+  {
+    // set the objective direction to minimize
+    set_minim( lp );
+
+    // print the LP problem
+    //write_LP(lp, stdout);
+    // write_lp(lp, "model.lp");
+
+    // print important message on screen while solving
+    set_verbose( lp, IMPORTANT );
+
+    // Now let lpsolve calculate a solution
+    ret = solve( lp );
+    if ( ret == OPTIMAL )
+    {
+      ret = 0;
+    }
+    else
+    {
+      ret = 7;
+    }
+  }
+
+  // get the results
+  if ( ret == 0 )
+  {
+    // objective value
+    printf( "Objactive value: %f\n", get_objective( lp ) );
+
+    // variable values
+    get_variables( lp, row );
+    int T = row[Ncol - 1];
+    for ( auto i = 0u; i < Ncol; ++i )
+    {
+      printf( "%s: %f\n", get_col_name( lp, i + 1 ), row[i] );
+    }
+
+    for ( auto i = 0u; i < NumVars; ++i )
+    {
+      if ( flip_table[i] == 0 )
+      {
+        linear_form.push_back( row[i] );
+      }
+      else
+      {
+        linear_form.push_back( -row[i] );
+        T = T - row[i];
+      }
+    }
+    linear_form.push_back( T );
+  }
+
+  // free allocated memory
+  if ( row != NULL )
+  {
+    free( row );
+  }
+  if ( colno != NULL )
+  {
+    free( colno );
+  }
+
+  // clean up such that all used memory by lpsolve is freed
+  if ( lp != NULL )
+  {
+    delete_lp( lp );
+  }
+
+  //std::cout << "ret = " << ret << endl;
+
+  // ret != 0 means non-TF
+  if ( ret != 0 )
+  {
+    return false;
+  }
   /* if tt is TF: */
   /* push the weight and threshold values into `linear_form` */
   if ( plf )
